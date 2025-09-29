@@ -8,7 +8,7 @@ from rdbtools import RdbParser
 from rdbtools import MemoryCallback
 
 
-from rdbtools.memprofiler import MemoryRecord, PrintAllKeys
+from rdbtools.memprofiler import MemoryRecord, PrintAllKeys, GroupedPrintAllKeys
 
 CSV_WITH_EXPIRY = """database,type,key,size_in_bytes,encoding,num_elements,len_largest_element,expiry
 0,string,expires_ms_precision,128,string,27,27,2022-12-25T10:11:12.573000
@@ -50,9 +50,14 @@ def get_sums(file_name):
     parser.parse(os.path.join(os.path.dirname(__file__), 'dumps', file_name))
     return stats.sums
 
-def get_csv(dump_file_name):
+def get_csv(dump_file_name, prefix_map=None, auto_group=False):
     buff = BytesIO()
-    callback = MemoryCallback(PrintAllKeys(buff, None, None), 64)
+    if prefix_map or auto_group:
+        mapped = list(prefix_map.items()) if prefix_map else None
+        stream = GroupedPrintAllKeys(buff, None, None, mapped, auto_detect=auto_group)
+    else:
+        stream = PrintAllKeys(buff, None, None)
+    callback = MemoryCallback(stream, 64)
     parser = RdbParser(callback)
     parser.parse(os.path.join(os.path.dirname(__file__), 
                     'dumps', dump_file_name))
@@ -74,6 +79,38 @@ class MemoryCallbackTestCase(unittest.TestCase):
     def test_csv_with_module(self):
         csv = get_csv('redis_40_with_module.rdb')
         self.assertEquals(csv, CSV_WITH_MODULE)
+
+    def test_grouped_csv(self):
+        csv = get_csv('parser_filters.rdb', auto_group=True)
+        lines = csv.strip().split('\n')
+        self.assertEqual(lines[0], "database,type,key,size_in_bytes,encoding,num_elements,len_largest_element,expiry")
+        prefix_rows = {
+            row.split(',')[2]: row.split(',')
+            for row in lines[1:]
+            if row.split(',')[2].endswith(':*')
+        }
+        self.assertIn('l:*', prefix_rows)
+        lists = prefix_rows['l:*']
+        self.assertEqual(lists[0], '0')
+        self.assertEqual(lists[1], 'list')
+        self.assertEqual(int(lists[3]), 2464)
+        self.assertEqual(lists[4], 'quicklist')
+        self.assertEqual(int(lists[5]), 33)
+        self.assertEqual(int(lists[6]), 578)
+
+    def test_grouped_csv_manual_alias(self):
+        csv = get_csv('parser_filters.rdb', prefix_map={'l': 'lists'})
+        lines = csv.strip().split('\n')
+        grouped = [line for line in lines[1:] if ',lists,' in line]
+        self.assertEqual(len(grouped), 1)
+        cols = grouped[0].split(',')
+        self.assertEqual(cols[0], '0')
+        self.assertEqual(cols[1], 'list')
+        self.assertEqual(cols[2], 'lists')
+        self.assertEqual(int(cols[3]), 2464)
+        self.assertEqual(cols[4], 'quicklist')
+        self.assertEqual(int(cols[5]), 33)
+        self.assertEqual(int(cols[6]), 578)
 
     def test_expiry(self):
         stats = get_stats('keys_with_expiry.rdb')

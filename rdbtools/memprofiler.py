@@ -4,6 +4,7 @@ from collections import namedtuple
 import random
 import bisect
 from distutils.version import StrictVersion
+import re
 try:
     import ujson as json
 except:
@@ -94,7 +95,7 @@ class PrintAllKeys(object):
 
         if self._largest is not None:
             self._heap = []
-    
+
     def next_record(self, record) :
         if record.key is None:
             return  # some records are not keys (e.g. dict)
@@ -116,6 +117,123 @@ class PrintAllKeys(object):
             while self._heap:
                 bytes, record = heappop(self._heap)
                 self.next_record(record)
+
+
+class GroupedPrintAllKeys(object):
+    MIXED_VALUE = 'mixed'
+    _DELIMITERS = (':', '|', '/', '\\', '.', '-')
+
+    def __init__(self, out, bytes, largest, prefix_map=None, auto_detect=False):
+        self._out = out
+        self._bytes_threshold = int(bytes) if bytes is not None else None
+        self._largest = int(largest) if largest is not None else None
+        # Ensure deterministic behaviour when multiple prefixes could match the same key by
+        # preserving declaration order and preferring the longest prefix.
+        self._prefix_map = list(prefix_map) if prefix_map else []
+        self._auto_detect = bool(auto_detect)
+        headers = "%s,%s,%s,%s,%s,%s,%s,%s\n" % (
+            "database", "type", "key", "size_in_bytes", "encoding", "num_elements", "len_largest_element", "expiry")
+        self._out.write(codecs.encode(headers, 'latin-1'))
+        self._records = {}
+        self._order = []
+        self._auto_aliases = {}
+
+    def _match_alias(self, key):
+        longest = -1
+        alias = None
+        for prefix, name in self._prefix_map:
+            if key.startswith(prefix) and len(prefix) > longest:
+                longest = len(prefix)
+                alias = name
+        if alias is not None:
+            return alias, 'manual'
+        if not self._auto_detect:
+            return None, None
+        prefix = self._auto_prefix(key)
+        if prefix is None:
+            return None, None
+        if prefix not in self._auto_aliases:
+            self._auto_aliases[prefix] = self._format_auto_alias(prefix)
+        return self._auto_aliases[prefix], 'auto'
+
+    def _auto_prefix(self, key):
+        if not key:
+            return None
+        for delimiter in self._DELIMITERS:
+            index = key.find(delimiter)
+            if index > 0:
+                return key[:index]
+        match = re.match(r'^([A-Za-z]+)(?=\d)', key)
+        if match:
+            return match.group(1)
+        return None
+
+    def _format_auto_alias(self, prefix):
+        return f"{prefix}:*"
+
+    def next_record(self, record):
+        if record.key is None:
+            return
+
+        alias, alias_source = self._match_alias(record.key)
+        if alias is not None:
+            group_key = ('group', alias_source, record.database, alias)
+            key_name = alias
+            expiry = ''
+            grouped = True
+        else:
+            group_key = ('key', record.database, record.key)
+            key_name = record.key
+            expiry = record.expiry.isoformat() if record.expiry else ''
+            grouped = False
+
+        if group_key not in self._records:
+            self._order.append(group_key)
+            self._records[group_key] = {
+                'database': record.database,
+                'type': record.type,
+                'key': key_name,
+                'bytes': record.bytes or 0,
+                'encoding': record.encoding,
+                'size': record.size or 0,
+                'len_largest_element': record.len_largest_element or 0,
+                'expiry': expiry,
+                'grouped': grouped
+            }
+            return
+
+        data = self._records[group_key]
+        data['bytes'] += record.bytes or 0
+        data['size'] += record.size or 0
+        data['len_largest_element'] = max(data['len_largest_element'], record.len_largest_element or 0)
+        if data['type'] != record.type:
+            data['type'] = self.MIXED_VALUE
+        if data['encoding'] != record.encoding:
+            data['encoding'] = self.MIXED_VALUE
+
+    def _filtered_records(self):
+        for key in self._order:
+            data = self._records[key]
+            if self._bytes_threshold is None or data['bytes'] >= self._bytes_threshold:
+                yield data
+
+    def end_rdb(self):
+        records = list(self._filtered_records())
+        if self._largest is not None:
+            records = nlargest(self._largest, records, key=lambda item: item['bytes'])
+
+        for data in records:
+            rec_str = "%d,%s,%s,%d,%s,%d,%d,%s\n" % (
+                data['database'],
+                data['type'],
+                data['key'],
+                data['bytes'],
+                data['encoding'],
+                data['size'],
+                data['len_largest_element'],
+                data['expiry']
+            )
+            self._out.write(codecs.encode(rec_str, 'latin-1'))
 
 class PrintJustKeys(object):
     def __init__(self, out):
