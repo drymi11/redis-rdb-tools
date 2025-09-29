@@ -4,6 +4,7 @@ import os
 import sys
 from argparse import ArgumentParser
 from rdbtools import RdbParser, JSONCallback, DiffCallback, MemoryCallback, ProtocolCallback, PrintAllKeys, KeysOnlyCallback, KeyValsOnlyCallback
+from rdbtools import GroupedPrintAllKeys
 from rdbtools.encodehelpers import ESCAPE_CHOICES
 from rdbtools.parser import HAS_PYTHON_LZF as PYTHON_LZF_INSTALLED
 
@@ -36,6 +37,10 @@ Example : %(prog)s --command json -k "user.*" /var/redis/6379/dump.rdb"""
                   help="Limit memory output to keys greater to or equal to this value (in bytes)")
     parser.add_argument("-l", "--largest", dest="largest", default=None,
                   help="Limit memory output to only the top N keys (by size)")
+    parser.add_argument("--group-prefix", dest="group_prefixes", action="append", default=[], metavar="PREFIX=ALIAS",
+                  help="Aggregate memory output for keys beginning with PREFIX under the provided ALIAS")
+    parser.add_argument("--auto-group-prefixes", dest="auto_group_prefixes", action="store_true", default=False,
+                  help="Automatically aggregate memory output by detected key prefixes")
     parser.add_argument("-e", "--escape", dest="escape", choices=ESCAPE_CHOICES,
                   help="Escape strings to encoding: %s (default), %s, %s, or %s." % tuple(ESCAPE_CHOICES))
     expire_group = parser.add_mutually_exclusive_group(required=False)
@@ -70,6 +75,19 @@ Example : %(prog)s --command json -k "user.*" /var/redis/6379/dump.rdb"""
             else:
                 filters['types'].append(x)
 
+    if options.group_prefixes:
+        prefix_map = []
+        for mapping in options.group_prefixes:
+            if '=' not in mapping:
+                raise Exception('Invalid group prefix mapping %s. Expected PREFIX=ALIAS format' % mapping)
+            prefix, alias = mapping.split('=', 1)
+            if not prefix or not alias:
+                raise Exception('Invalid group prefix mapping %s. Expected PREFIX=ALIAS format' % mapping)
+            prefix_map.append((prefix, alias))
+        options.group_prefix_map = prefix_map
+    else:
+        options.group_prefix_map = []
+
     out_file_obj = None
     try:
         if options.output:
@@ -84,8 +102,16 @@ Example : %(prog)s --command json -k "user.*" /var/redis/6379/dump.rdb"""
                 'json': lambda f: JSONCallback(f, string_escape=options.escape),
                 'justkeys': lambda f: KeysOnlyCallback(f, string_escape=options.escape),
                 'justkeyvals': lambda f: KeyValsOnlyCallback(f, string_escape=options.escape),
-                'memory': lambda f: MemoryCallback(PrintAllKeys(f, options.bytes, options.largest),
-                                                   64, string_escape=options.escape),
+                'memory': lambda f: MemoryCallback(
+                    GroupedPrintAllKeys(
+                        f,
+                        options.bytes,
+                        options.largest,
+                        options.group_prefix_map if options.group_prefix_map else None,
+                        auto_detect=options.auto_group_prefixes)
+                    if (options.group_prefix_map or options.auto_group_prefixes) else
+                    PrintAllKeys(f, options.bytes, options.largest),
+                    64, string_escape=options.escape),
                 'protocol': lambda f: ProtocolCallback(f, string_escape=options.escape,
                                                        emit_expire=not options.no_expire,
                                                        amend_expire=options.amend_expire
